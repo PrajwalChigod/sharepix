@@ -1,0 +1,11 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h1>{{ 'Here are your search results' }}</h1>
+{% for search in source_elem.hits.hits %}
+<article class="media content-section">
+    <div class="media-body">
+        <h4> Username : {{ search._source.username }} & id : {{ search._source.id }} {{ search._source.email }} </h4>
+    </div>
+</article>
+{% endfor %}
+{% endblock %}

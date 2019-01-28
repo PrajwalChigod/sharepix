@@ -1,16 +1,18 @@
 import os
 import time
+import redis
 import secrets
+from elasticsearch import Elasticsearch
 from PIL import Image
-from sharepix import celery
-from werkzeug.utils import secure_filename
+from sharepix import download_user_data
 from sharepix.models import User, ImagePost
-from sharepix import app, base_dir, db, bcrypt
+from sharepix import app, base_dir, db, bcrypt, celery
 from flask_login import login_user, current_user, logout_user, login_required
 from sharepix.forms import RegistrationForm, LoginForm, UpdateAccountForm, PhotoForm
 from flask_uploads import UploadSet, configure_uploads, IMAGES, patch_request_class
-from flask import render_template, url_for, flash, redirect, send_from_directory, request, abort, send_file, json
+from flask import render_template, url_for, flash, redirect, send_from_directory, request, abort, send_file, json, jsonify
 
+es = Elasticsearch()
 
 UPLOAD_FOLDER = '/home/chigod/Pictures'
 app.config['UPLOADED_PHOTOS_DEST'] = base_dir + '/static/images'
@@ -23,7 +25,7 @@ patch_request_class(app, size=64*250*250)
 @app.route("/home")
 def home():
     page = request.args.get('page', 1, type=int)
-    posts = ImagePost.query.paginate(page=page, per_page=5)
+    posts = ImagePost.query.order_by(ImagePost.date_posted.desc()).paginate(page=page, per_page=5)
     return render_template('home.html', posts=posts)
 
 
@@ -143,30 +145,61 @@ def user_posts(username):
     return render_template('user_posts.html', posts=posts, user=user)
 
 
-@app.route('/user/download/<string:username>')
+@app.route('/user/download/<string:username>', methods=['GET', 'POST'])
 @login_required
 def downloads(username):
-    print(username)
-    downloads_task.apply_async((username))
-    return redirect('home')
+    async_result = download_user_data.downloads_task.delay(username)
+    return jsonify(download_user_data.downloads_task(username)), 202, {'Location': url_for('task_status', task_id=async_result.id)}
 
 
-@celery.task(bind=True)
-def downloads_task(self, username):
-    user = User.query.filter_by(username=username).first_or_404()
-    posts = ImagePost.query.filter_by(author=user)
-    data = {}
-    data[username] = []
-    url = base_dir + url_for('static', filename='download.txt')
-    print(url)
-    with open(url, 'w') as file_d:
-        for post in posts:
-            time.sleep(5)
-            dpost = {}
-            dpost['title'] = post.title
-            dpost['image_content'] = post.image_content
-            dpost['id'] = post.id
-            dpost['date_posted'] = post.date_posted
-            data[username].append(dpost)
-            json.dump(dpost, file_d)
-    return send_file(url, as_attachment=True)
+@app.route('/task/<string:task_id>', methods=['GET'])
+def task_status(task_id):
+    result = download_user_data.downloads_task.AsyncResult(task_id)
+    if result.ready():
+        data = result.get()
+        status = "DONE"
+    else:
+        status = "PENDING"
+        data = {}
+    return jsonify(data, {'status':status})
+
+
+
+
+
+#  ---------------------------------elastic search----------------------------------------
+# @app.before_request
+@app.route('/insert-data')
+def insert_data():
+    INDEX_NAME = 'userp'
+    es.indices.delete(INDEX_NAME)
+    es.indices.create(INDEX_NAME)
+    query = User.query.all()
+    body_index = []
+    id = 1
+    for index in range(len(query)):
+        body = {
+            'id': query[index].id,
+            'username': query[index].username
+        }
+        body_index.append(body)
+        es.index(index=INDEX_NAME, doc_type='title', id=id, body=body)
+        id += 1
+    return jsonify(body_index)
+
+@app.route('/search', methods=['GET','POST'])
+def search():
+    if request.method =='POST':
+        keyword = request.form['keyword']
+        search_query = {
+            "query": {
+                "query_string": {
+                    "query": keyword+"*",
+                    "fields": ["username"]
+                }
+            }
+        }
+        es.indices.refresh(index='userp')
+        resp = es.search(index='userp', body=search_query)
+        return render_template('search.html', keyword=keyword, source_elem=resp)
+    return render_template('layout.html')
